@@ -1,0 +1,50 @@
+//// Overview
+// Created by Henk van de Crommert, version 0.1
+// Query to calculate the server uptime, using Azure's Heartbeat and Activity log information. 
+// Query considers the difference between user and platform-initiated downtime.
+// Query does not consider application availability, but if application health monitoring is available the script can be modified to do so. 
+
+// Set script-level parameters
+let REPORT_START_TIME = ago(14d);
+let REPORT_END_TIME = ago(0m);
+
+//// Step 1:
+// Query the Heartbeat data to get the first / last heathbeat per VM.
+// This value provides an approximation for the service uptime.
+// Note that this is a workable approximation, but accurracy may be slightly lower on the start / end of the reporting period.
+let ServerUptime = Heartbeat
+| where TimeGenerated >= REPORT_START_TIME and TimeGenerated <= REPORT_END_TIME
+| summarize min(TimeGenerated), max(TimeGenerated) by ResourceGroup, Resource
+| project ResourceGroup=tolower(ResourceGroup), Resource=tolower(Resource), ["First Heartbeat Signal"]=min_TimeGenerated, ["Last Heartbeat Signal"] = max_TimeGenerated, Uptime=(max_TimeGenerated - min_TimeGenerated);
+
+//// Step 2:
+// Query the Azure Activity log to get periods of unavailability
+// This information is then categorized into 'user initiated' and 'platform initiated' downtime.
+let ServerOutages = AzureActivity
+| where TimeGenerated >= REPORT_START_TIME and TimeGenerated <= REPORT_END_TIME
+| extend parsedProp = parse_json(Properties)
+| extend parsedEventProp = parse_json(tostring(parsedProp.eventProperties))
+| where parsedProp.eventCategory == 'ResourceHealth'
+| order by TimeGenerated desc
+| project ResourceGroup, Resource= tostring(parsedProp.resource), CorrelationId, TimeGenerated, ActivityStatusValue, Status=parsedEventProp.currentHealthStatus, Cause=parsedEventProp.cause
+| summarize (r0, resource_stable_available_after_downtime)=arg_max(tobool(ActivityStatusValue == 'Resolved' and Status == 'Available'), TimeGenerated), (r1, resource_first_unavailable_during_downtime)=arg_max(tobool(ActivityStatusValue == 'Active' and Status == 'Unavailable'), TimeGenerated), makeset(Cause) by ResourceGroup, Resource, CorrelationId
+| project ResourceGroup=tolower(ResourceGroup), Resource=tolower(Resource) , set_Cause, Downtime = resource_stable_available_after_downtime - resource_first_unavailable_during_downtime;
+
+//// Step 3:
+// Use the calculated service outages to calculate the sum and frequency of downtime per cause
+let ServerOutagesByCause = ServerOutages
+| summarize UserInitiatedDowntime = sumif(Downtime, set_Cause has "UserInitiated"), UserInitiatedDowntimeCount= countif(set_Cause has "UserInitiated"), PlatformInitiatedDowntime = sumif(Downtime, set_Cause has "PlatformInitiated"), PlatformInitiatedDowntimeCount = countif(set_Cause has "PlatformInitiated") by ResourceGroup, Resource;
+
+/// Step 4:
+// Combine the information into a report on system availability per server and cause:
+ServerUptime
+| join kind=leftouter
+(
+ ServerOutagesByCause
+)
+on ResourceGroup, Resource
+| project ResourceGroup, Resource, ["First Heartbeat Signal"], ["Last Heartbeat Signal"], ["Total Uptime"] = Uptime, ["User initiated downtime (count)"] = UserInitiatedDowntimeCount, ["User initiated downtime (duration)"] = UserInitiatedDowntime, ["Platform initiated downtime (count)"] = PlatformInitiatedDowntimeCount, ["Platform Initiated downtime (duration)"] = PlatformInitiatedDowntime, ["%Availability (Total)"] = (Uptime - UserInitiatedDowntime - PlatformInitiatedDowntime) / Uptime * 100, ["%Availability (Excl. Platform-initiated downtime)"] = (Uptime - PlatformInitiatedDowntime) / Uptime * 100
+ 
+
+ 
+ 
